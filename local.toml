@@ -1,2 +1,0 @@
-[amqp]
-rabbitmq = "amqp://test:testuser@127.0.0.1:5672/dev"
