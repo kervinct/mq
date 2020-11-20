@@ -1,38 +1,12 @@
 package mq
 
 import (
-	"fmt"
-	"os"
-
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/viper"
 	"github.com/streadway/amqp"
+	"github.com/zvnlanx/mq/invariant"
 )
 
-func init() {
-	log.SetFormatter(&log.JSONFormatter{})
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.ErrorLevel)
-
-	viper.SetConfigName("local")
-	viper.AddConfigPath(".")
-	viper.SetConfigType("toml")
-	viper.AllowEmptyEnv(true)
-	_ = viper.ReadInConfig()
-}
-
-var (
-	// MQURL 地址
-	MQURL = viper.GetString("amqp.rabbitmq")
-)
-
-// MQHandler 控制器
+// MQHandler 队列Handler
 type MQHandler struct {
-	Object *RabbitMQ
-}
-
-// RabbitMQ 对象
-type RabbitMQ struct {
 	conn    *amqp.Connection
 	channel *amqp.Channel
 
@@ -40,194 +14,404 @@ type RabbitMQ struct {
 	Exchange  string
 	Key       string
 	URL       string
+	done      chan error
 }
 
-// NewRabbitMQ 创建基本对象
-func NewRabbitMQ(queueName, exchange, key string) *RabbitMQ {
-	mq := &RabbitMQ{
+// NewMQHandler 创建基本对象
+func NewMQHandler(queueName, exchange, key string) (*MQHandler, error) {
+	mq := &MQHandler{
 		QueueName: queueName,
 		Exchange:  exchange,
 		Key:       key,
-		URL:       MQURL,
+		URL:       invariant.RabbitMQURL,
+		done:      make(chan error),
 	}
 
 	var err error
 	mq.conn, err = amqp.Dial(mq.URL)
-	mq.failOnErr(err, "Create connection failed")
+	if err != nil {
+		return nil, err
+	}
 	mq.channel, err = mq.conn.Channel()
-	mq.failOnErr(err, "Get channel failed")
-
-	return mq
+	if err != nil {
+		return nil, err
+	}
+	return mq, nil
 }
 
 // Destroy 销毁
-func (r *RabbitMQ) Destroy() {
+func (r *MQHandler) Destroy() {
+	<-r.done
 	r.channel.Close()
 	r.conn.Close()
 }
 
-func (r *RabbitMQ) failOnErr(err error, reason string) {
-	if err != nil {
-		log.WithFields(log.Fields{
-			"err":    err,
-			"reason": reason,
-		}).Fatal("RabbitMQ failed on:")
-	}
-}
-
 // -----------------------------------------------------------
 
-// NewRabbitMQSimple 简单对象
-func NewRabbitMQSimple(queueName string) *RabbitMQ {
-	return NewRabbitMQ(queueName, "", "")
+// NewMQHandlerSimple 简单队列
+func NewMQHandlerSimple(queueName string) (*MQHandler, error) {
+	return NewMQHandler(queueName, "", "")
 }
 
-// PublishSimple 简单发布
-func (r *RabbitMQ) PublishSimple(message string) {
-	_, err := r.channel.QueueDeclare(r.QueueName, false, false, false, false, nil)
-
+// Push 简单发布
+func (r *MQHandler) Push(message string) error {
+	// 声明发送到的队列
+	_, err := r.channel.QueueDeclare(
+		r.QueueName, // queue name
+		false,       // durable  持久化
+		false,       // delete when unused
+		false,       // exclusive 单个连接使用queue，在连接断开时自动删除
+		false,       // no-wait
+		nil,         // arguments 队列类型、消息TTL、队列长度限制等
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed declare queue in PublishSimple")
+		return err
 	}
 
-	r.channel.Publish(r.Exchange, r.QueueName, false, false, amqp.Publishing{
-		ContentType: "text/plain",
-		Body:        []byte(message),
-	})
+	// 发送消息
+	r.channel.Publish(
+		r.Exchange,  // exchange
+		r.QueueName, // routing key
+		false,       // mandatory
+		false,       // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+		},
+	)
+
+	return nil
 }
 
-// ConsumeSimple 简单消费
-func (r *RabbitMQ) ConsumeSimple() {
+// Consume 简单消费
+func (r *MQHandler) Consume(handle func(<-chan amqp.Delivery, chan error)) error {
+	// 声明消费的队列，确定消费前队列存在
 	_, err := r.channel.QueueDeclare(r.QueueName, false, false, false, false, nil)
 	if err != nil {
-		r.failOnErr(err, "Failed declare queue in ConsumeSimple")
+		return err
 	}
-
-	messages, err := r.channel.Consume(r.QueueName, "", true, false, false, false, nil)
+	// 通知服务器通过队列异步分发消息
+	deliveries, err := r.channel.Consume(
+		r.QueueName, // queue
+		"",          // consumer
+		true,        // auto-ack
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed consume in ConsumeSimple")
+		return err
 	}
 
-	forever := make(chan bool)
-	go func() {
-		for d := range messages {
-			// logic
-			fmt.Printf("Received a message %s\n", d.Body)
-		}
-	}()
+	go handle(deliveries, r.done)
 
-	println("[*] Waiting for messages, to exit press CTRL+C")
-	<-forever
+	return nil
 }
 
 // ---------------------------------------------------------
 
-// NewRabbitMQPubSub 发布订阅对象
-func NewRabbitMQPubSub(exchangeName string) *RabbitMQ {
-	return NewRabbitMQ("", exchangeName, "")
+// NewMQHandlerWorkQueue 多工作队列
+func NewMQHandlerWorkQueue(queueName string) (*MQHandler, error) {
+	return NewMQHandler(queueName, "", "")
 }
 
-// PublishPub 发布
-func (r *RabbitMQ) PublishPub(message string) {
-	err := r.channel.ExchangeDeclare(r.Exchange, "fanout", true, false, false, false, nil)
+// WorkerPublish 发布
+func (r *MQHandler) WorkerPublish(message string) error {
+	// 声明发送到的队列
+	_, err := r.channel.QueueDeclare(
+		r.QueueName, // name
+		true,        // durable 1.队列持久化
+		false,       // delete when unused
+		false,       // exclusive
+		false,       // no-wait
+		nil,         // arguments
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed declare exchange in PublishPub")
+		return err
 	}
 
-	err = r.channel.Publish(r.Exchange, "", false, false, amqp.Publishing{
-		ContentType: "text/plain",
-		Body:        []byte(message),
-	})
-	if err != nil {
-		r.failOnErr(err, "Failed publish in PublishPub")
-	}
+	// 发送消息
+	r.channel.Publish(
+		r.Exchange,  // exchange，若为''则使用默认exchange
+		r.QueueName, // routing key
+		false,       // mandatory
+		false,       // immediate
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent, // 2.消息持久化
+			ContentType:  "text/plain",
+			Body:         []byte(message),
+		},
+	)
+
+	return nil
 }
 
-// ReceiveSub 订阅接收
-func (r *RabbitMQ) ReceiveSub() {
-	err := r.channel.ExchangeDeclare(r.Exchange, "fanout", true, false, false, false, nil)
+// WorkerConsume 消费worker
+func (r *MQHandler) WorkerConsume(handle func(<-chan amqp.Delivery, chan error)) error {
+	// 声明消费的队列，确定消费前队列存在
+	_, err := r.channel.QueueDeclare(r.QueueName, false, false, false, false, nil)
 	if err != nil {
-		r.failOnErr(err, "Failed declare exchange in ReceiveSub")
+		return err
 	}
 
-	q, err := r.channel.QueueDeclare("", false, false, true, false, nil)
-	if err != nil {
-		r.failOnErr(err, "Failed declare queue in ReceiveSub")
+	// 配置预取
+	if err = r.channel.Qos(
+		1,     // prefetch count
+		0,     // prefetch size
+		false, // global
+	); err != nil {
+		return err
 	}
 
-	err = r.channel.QueueBind(q.Name, "", r.Exchange, false, nil)
+	// 通知服务器通过队列异步分发消息
+	deliveries, err := r.channel.Consume(
+		r.QueueName, // queue
+		"",          // consumer
+		true,        // auto-ack 若手工ack，这里设置false
+		false,       // exclusive
+		false,       // no-local
+		false,       // no-wait
+		nil,         // args
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed bind queue in ReceiveSub")
+		return err
 	}
 
-	messages, err := r.channel.Consume(q.Name, "", true, false, false, false, nil)
+	go handle(deliveries, r.done)
+
+	return nil
+}
+
+// ---------------------------------------------------------
+
+// NewMQHandlerPubSub 发布订阅
+func NewMQHandlerPubSub(exchangeName string) (*MQHandler, error) {
+	return NewMQHandler("", exchangeName, "")
+}
+
+// Publish 发布
+func (r *MQHandler) Publish(message string) error {
+	err := r.channel.ExchangeDeclare(
+		r.Exchange, // exchange name
+		"fanout",   // type
+		true,       // durable
+		false,      // auto-deleted 无订阅时自动删除
+		false,      // internal
+		false,      // no-wait
+		nil,        // args
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed consume in ReceiveSub")
+		return err
 	}
 
-	forever := make(chan bool)
-	go func() {
-		for d := range messages {
-			fmt.Printf("Received a message: %s\n", d.Body)
-		}
-	}()
+	err = r.channel.Publish(
+		r.Exchange, // exchange name
+		"",         // routing key
+		false,      // mandatory
+		false,      // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+		},
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
 
-	println("[*] Waiting for messages, to exit press CTRL+C")
-	<-forever
+// Subscribe 订阅
+func (r *MQHandler) Subscribe(handle func(<-chan amqp.Delivery, chan error)) error {
+	err := r.channel.ExchangeDeclare(
+		r.Exchange, // exchange name
+		"fanout",   // type
+		true,       // durable
+		false,      // auto-deleted
+		false,      // internal
+		false,      // no-wait
+		nil,        // args
+	)
+	if err != nil {
+		return err
+	}
+
+	q, err := r.channel.QueueDeclare(
+		"",    // temporary queue name
+		false, // durable
+		false, // delete when unused
+		true,  // exclusive 仅能被声明该Queue的conn操作
+		false, // no-wait
+		nil,   // args
+	)
+	if err != nil {
+		return err
+	}
+
+	err = r.channel.QueueBind(
+		q.Name,     // queue name
+		"",         // routing key
+		r.Exchange, // exchange
+		false,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
+	deliveries, err := r.channel.Consume(
+		q.Name, // queue name
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	if err != nil {
+		return err
+	}
+
+	go handle(deliveries, r.done)
+
+	return nil
 }
 
 // ----------------------------------------------------------
 
-// NewRabbitMQRouting 路由分发
-func NewRabbitMQRouting(exchangeName, routingKey string) *RabbitMQ {
-	return NewRabbitMQ("", exchangeName, routingKey)
+// NewMQHandlerRouting 路由分发
+func NewMQHandlerRouting(exchangeName string) (*MQHandler, error) {
+	return NewMQHandler("", exchangeName, "")
 }
 
-// PublishRouting 路由分发
-func (r *RabbitMQ) PublishRouting(message string) {
-	err := r.channel.ExchangeDeclare(r.Exchange, "direct", true, false, false, false, nil)
+// RoutingPublish 路由分发
+func (r *MQHandler) RoutingPublish(message, routingKey string) error {
+	err := r.channel.ExchangeDeclare(
+		r.Exchange, // exchange name
+		"direct",   // type
+		true,       // durable
+		false,      // auto-deleted
+		false,      // internal
+		false,      // no-wait
+		nil,        // args
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed declare exchange in PublishRouting")
+		return err
 	}
 
-	err = r.channel.Publish(r.Exchange, r.Key, false, false, amqp.Publishing{
-		ContentType: "text/plain",
-		Body:        []byte(message),
-	})
+	err = r.channel.Publish(
+		r.Exchange, // exchange name
+		routingKey, // routing key
+		false,      // mandatory
+		false,      // immediate
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+		},
+	)
 	if err != nil {
-		r.failOnErr(err, "Failed publish in PublishRouting")
+		return err
 	}
+	return nil
 }
 
-// ReceiveRouting 路由接收
-func (r *RabbitMQ) ReceiveRouting() {
+// RoutingConsume 消费路由
+func (r *MQHandler) RoutingConsume(bindingKeys []string, handle func(<-chan amqp.Delivery, chan error)) error {
 	err := r.channel.ExchangeDeclare(r.Exchange, "direct", true, false, false, false, nil)
 	if err != nil {
-		r.failOnErr(err, "Failed declare exchange in ReceiveRouting")
+		return err
 	}
 
 	q, err := r.channel.QueueDeclare("", false, false, false, false, nil)
 	if err != nil {
-		r.failOnErr(err, "Failed delcare queue in ReceiveRouting")
+		return err
 	}
 
-	err = r.channel.QueueBind(q.Name, r.Key, r.Exchange, false, nil)
-	if err != nil {
-		r.failOnErr(err, "Failed bind queue in ReceiveRouting")
-	}
-
-	messages, err := r.channel.Consume(q.Name, "", true, false, false, false, nil)
-	if err != nil {
-		r.failOnErr(err, "Failed consume in ReceiveRouting")
-	}
-
-	forever := make(chan bool)
-	go func() {
-		for d := range messages {
-			fmt.Printf("Received a message: %s\n", d.Body)
+	for _, bindingKey := range bindingKeys {
+		err = r.channel.QueueBind(
+			q.Name,     // temporary queue name
+			bindingKey, // binding key
+			r.Exchange, // exchange name
+			false,
+			nil,
+		)
+		if err != nil {
+			return err
 		}
-	}()
+	}
 
-	println("[*] Waiting for messages, to exit press CTRL+C")
-	<-forever
+	deliveries, err := r.channel.Consume(q.Name, "", true, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	go handle(deliveries, r.done)
+
+	return nil
+}
+
+// ----------------------------------------------------------
+
+// NewMQHandlerTopic 基于Topic分发
+func NewMQHandlerTopic(exchangeName string) (*MQHandler, error) {
+	return NewMQHandler("", exchangeName, "")
+}
+
+// TopicPublish Topic发布
+func (r *MQHandler) TopicPublish(message, routingTopic string) error {
+	if err := r.channel.ExchangeDeclare(
+		r.Exchange,
+		"topic",
+		true,
+		false,
+		false,
+		false,
+		nil,
+	); err != nil {
+		return err
+	}
+
+	if err := r.channel.Publish(
+		r.Exchange,
+		routingTopic,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+		},
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TopicConsume Topic消费
+func (r *MQHandler) TopicConsume(bindingTopics []string, handle func(<-chan amqp.Delivery, chan error)) error {
+	err := r.channel.ExchangeDeclare(r.Exchange, "topic", true, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	q, err := r.channel.QueueDeclare("", false, true, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	for _, bindingTopic := range bindingTopics {
+		err = r.channel.QueueBind(q.Name, bindingTopic, r.Exchange, false, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	deliveries, err := r.channel.Consume(q.Name, "", true, false, false, false, nil)
+	if err != nil {
+		return err
+	}
+
+	go handle(deliveries, r.done)
+
+	return nil
 }
