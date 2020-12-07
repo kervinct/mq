@@ -111,12 +111,18 @@ func (sc *SubChannel) IsFull() bool {
 	return len(sc.SubCh) == cap(sc.SubCh)
 }
 
-// RegisterIfNotExists xx
-func (sc *SubChannel) RegisterIfNotExists(userKey string, w *WS) {
+// RegisterWithLock xx
+func (sc *SubChannel) RegisterWithLock(userKey string, w *WS) {
 	sc.userListLock.Lock()
 	defer sc.userListLock.Unlock()
 
-	if _, ok := sc.UserList[userKey]; !ok {
+	old, ok := sc.UserList[userKey]
+	if !ok {
+		sc.UserList[userKey] = w
+		return
+	}
+
+	if old.Closed() {
 		sc.UserList[userKey] = w
 	}
 }
@@ -160,7 +166,7 @@ func Subscribe(w *WS, data []byte) error {
 	switch params {
 	case "all", "a", "*":
 		for _, subch := range GlobalChannelMap {
-			subch.RegisterIfNotExists(userKey, w)
+			subch.RegisterWithLock(userKey, w)
 		}
 	default:
 		for _, sub := range strings.Split(params, ",") {
@@ -170,7 +176,7 @@ func Subscribe(w *WS, data []byte) error {
 			if _, ok := subscribes[kind.toString()]; !ok {
 				subch.UnRegisterWithLock(userKey)
 			} else {
-				subch.RegisterIfNotExists(userKey, w)
+				subch.RegisterWithLock(userKey, w)
 			}
 		}
 	}
