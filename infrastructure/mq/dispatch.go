@@ -13,6 +13,24 @@ import (
 
 var rc *redis.Client
 
+// GlobalChannelMap 全局品种订阅表
+var GlobalChannelMap map[BT]*SubChannel
+
+const (
+	subscribePrefix = "TICKS:"
+
+	bufSize = 1000
+)
+
+var (
+	// SUBALL 全部订阅
+	SUBALL BT = subscribePrefix + "*"
+	// USDCAD 美元
+	USDCAD BT = subscribePrefix + "USDCAD"
+	// EURCAD 欧元
+	EURCAD BT = subscribePrefix + "EURCAD"
+)
+
 func init() {
 	rc = redis.NewClient(&redis.Options{
 		Addr:         ":6379",
@@ -25,6 +43,18 @@ func init() {
 		DB:           0,
 	})
 
+	GlobalChannelMap = map[BT]*SubChannel{
+		USDCAD: {
+			Name:     USDCAD,
+			SubCh:    make(chan *redis.Message, bufSize),
+			UserList: make(map[string]*WS),
+		},
+		EURCAD: {
+			Name:     EURCAD,
+			SubCh:    make(chan *redis.Message, bufSize),
+			UserList: make(map[string]*WS),
+		},
+	}
 }
 
 // BT 订阅品种
@@ -33,19 +63,6 @@ type BT string
 func (b *BT) toString() string {
 	return string(*b)
 }
-
-const (
-	subscribePrefix = "TICKS:"
-)
-
-var (
-	// SUBALL 全部订阅
-	SUBALL BT = subscribePrefix + "*"
-	// USDCAD 美元
-	USDCAD BT = subscribePrefix + "USDCAD"
-	// ERUCAD 欧元
-	ERUCAD BT = subscribePrefix + "ERUCAD"
-)
 
 // WS 封装Websocket
 type WS struct {
@@ -115,13 +132,6 @@ func (sc *SubChannel) UnRegisterWithLock(userKey string) {
 // UnRegisterAlreadyLocked xx
 func (sc *SubChannel) UnRegisterAlreadyLocked(userKey string) {
 	delete(sc.UserList, userKey)
-}
-
-// GlobalChannelMap 全局品种订阅表
-var GlobalChannelMap map[BT]*SubChannel
-
-func init() {
-	GlobalChannelMap = make(map[BT]*SubChannel)
 }
 
 // Req 用户请求
