@@ -16,16 +16,18 @@ var rc *redis.Client
 func init() {
 	rc = redis.NewClient(&redis.Options{
 		Addr:         ":6379",
+		Password:     "",
 		DialTimeout:  10 * time.Second,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		PoolSize:     10,
 		PoolTimeout:  30 * time.Second,
+		DB:           0,
 	})
 
 }
 
-// BT 品种
+// BT 订阅品种
 type BT string
 
 func (b *BT) toString() string {
@@ -85,6 +87,11 @@ type SubChannel struct {
 	// map userKey WS
 	UserList     map[string]*WS
 	userListLock sync.Mutex
+}
+
+// IsFull 订阅通道已满
+func (sc *SubChannel) IsFull() bool {
+	return len(sc.SubCh) == cap(sc.SubCh)
 }
 
 // RegisterIfNotExists xx
@@ -170,6 +177,9 @@ func subscriberWorker() {
 	channel := pubsub.Channel()
 	for msg := range channel {
 		kind := BT(msg.Channel)
+		if GlobalChannelMap[kind].IsFull() {
+			<-GlobalChannelMap[kind].SubCh
+		}
 		GlobalChannelMap[kind].SubCh <- msg
 	}
 }
@@ -195,23 +205,25 @@ func process(data string) []byte {
 
 func consumerWorker() {
 	for kind, sub := range GlobalChannelMap {
-		go func(k BT, s *SubChannel) {
-			for {
-				s.userListLock.Lock()
-				select {
-				case msg := <-s.SubCh:
-					data := process(msg.Payload)
+		go consume(kind, sub)
+	}
+}
 
-					for userKey, userConn := range s.UserList {
-						if userConn.Closed() {
-							s.UnRegisterAlreadyLocked(userKey)
-							continue
-						}
-						userConn.Send([]byte(data))
-					}
+func consume(k BT, s *SubChannel) {
+	for {
+		s.userListLock.Lock()
+		select {
+		case msg := <-s.SubCh:
+			data := process(msg.Payload)
+
+			for userKey, userConn := range s.UserList {
+				if userConn.Closed() {
+					s.UnRegisterAlreadyLocked(userKey)
+					continue
 				}
-				s.userListLock.Unlock()
+				userConn.Send([]byte(data))
 			}
-		}(kind, sub)
+		}
+		s.userListLock.Unlock()
 	}
 }
